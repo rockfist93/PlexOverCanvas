@@ -278,6 +278,11 @@ app.get('/api/plex/item/:key', requireLogin, requireServer, wrap(async (req, res
   res.json(await plex.item(req.plex, req.params.key));
 }));
 
+app.get('/api/plex/subtitles/:key', requireLogin, requireServer, wrap(async (req, res) => {
+  if (!/^\d+$/.test(req.params.key)) return res.status(400).json({ error: 'Bad key' });
+  res.json(await plex.subtitles(req.plex, req.params.key));
+}));
+
 app.get('/api/plex/thumb', requireLogin, requireServer, wrap(async (req, res) => {
   var p = String(req.query.path || '');
   if (!/^\/library\/[\w/.-]+$/.test(p)) return res.status(400).end();
@@ -308,12 +313,18 @@ app.get('/api/audio', async (req, res) => {
     '-f', 'mp3', '-'
   );
   benchMark(req.query.bench, 'audio');
-  const ffmpeg = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+  const ffmpeg = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  ffmpeg.stderr.on('data', d => console.log('ffmpeg:', d.toString()));
   ffmpeg.stdout.pipe(res);
   ffmpeg.on('error', () => { try { res.end(); } catch (e) {} });
   ffmpeg.on('exit', () => { try { res.end(); } catch (e) {} });
   req.on('close', () => ffmpeg.kill('SIGKILL'));
 });
+
+app.get('/api/plex/audio/:key', requireLogin, requireServer, wrap(async (req, res) => {
+  if (!/^\d+$/.test(req.params.key)) return res.status(400).json({ error: 'Bad key' });
+  res.json(await plex.audioTracks(req.plex, req.params.key));
+}));
 
 // ============================================================
 // VIDEO: MPEG1-TS over WebSocket, decoded client-side by JSMpeg.
@@ -328,7 +339,8 @@ const server = app.listen(PORT, HOST, () => {
 });
 
 server.on('upgrade', (req, socket, head) => {
-  if (url.parse(req.url).pathname === '/ws/video') {
+  const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
+  if (pathname === '/ws/video') {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
   } else {
     socket.destroy();
@@ -340,7 +352,7 @@ function send(ws, type, message, extra) {
 }
 
 wss.on('connection', async (ws, req) => {
-  const q = url.parse(req.url, true).query;
+  const q = Object.fromEntries(new URL(req.url, `http://${req.headers.host}`).searchParams);
   const preset = QUALITY[parseInt(q.quality)] || QUALITY[720];
   const muxed = q.mode !== 'split';
   const avSync = muxed ? Math.max(0, Math.min(2000, q.avsync != null && q.avsync !== '' ? parseInt(q.avsync) || 0 : AV_SYNC_MS)) : 0;
@@ -356,20 +368,84 @@ wss.on('connection', async (ws, req) => {
   if (source.duration) send(ws, 'info', source.title, { duration: source.duration });
 
   send(ws, 'status', 'Starting stream...');
+  const audioIndex = parseInt(q.audio);
+  const useAudio = isFinite(audioIndex) && audioIndex >= 0;
+
   var args = inputArgs(source, muxed ? 'both' : 'video', parseOffset(q.offset));
-  // Delaying video timestamps makes the TS muxer (which interleaves by
-  // timestamp) send each frame avSync ms after its audio.
-  // Real rate control (a fixed -q:v let grainy sources hit 5 Mbit/s at
-  // 480p). Keep the source frame rate up to 30 fps: forcing 30 duplicated
-  // every 4th frame of 23.976 fps film, which judders.
+  if (muxed && useAudio && !source.generator) {
+    for (var i = args.length - 1; i >= 0; i--) {
+      if (args[i] === '-map' && args[i + 1] && args[i + 1].indexOf('0:a') === 0) {
+        args.splice(i, 2);
+      }
+    }
+    args.push('-map', '0:a:' + audioIndex);
+  }
   var maxKbps = Math.round(preset.kbps * 1.25);
+
+  // Optional subtitle burn-in with caching
+  const subIndex = parseInt(q.sub);
+  const useSub = !source.generator && isFinite(subIndex) && subIndex >= 0;
+  let subFile = null;
+  const streamOffset = parseOffset(q.offset);
+
+  if (useSub) {
+    try {
+      fs.mkdirSync('/app/data/tmp', { recursive: true });
+      const cacheKey = String(q.src || '').replace(/[^a-z0-9]/gi, '_') + '-s' + subIndex;
+      subFile = `/app/data/tmp/${cacheKey}.srt`;
+
+      // Use cache if it exists and has content
+      if (!fs.existsSync(subFile) || fs.statSync(subFile).size === 0) {
+        console.log('Extracting subtitle to cache:', subFile);
+        await new Promise((resolve, reject) => {
+          const extractArgs = ['-i', source.url, '-map', `0:s:${subIndex}`, '-c:s', 'srt', '-y', subFile];
+          const extract = spawn(FFMPEG, extractArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+          let err = '';
+          extract.stderr.on('data', d => { err += d.toString(); });
+          extract.on('error', reject);
+          extract.on('close', code => code === 0 ? resolve() : reject(new Error(err.slice(-300))));
+        });
+        // Strip font tags so force_style works
+        if (fs.existsSync(subFile)) {
+          let content = fs.readFileSync(subFile, 'utf8');
+          content = content.replace(/<[^>]+>/g, '');
+          fs.writeFileSync(subFile, content);
+        }
+      } else {
+        console.log('Using cached subtitle:', subFile);
+      }
+    } catch (e) {
+      console.error('Subtitle extract failed:', e.message);
+      subFile = null;
+    }
+  }
+
+// Shift SRT timestamps if starting mid-file
+  if (subFile && streamOffset > 0 && fs.existsSync(subFile)) {
+    let content = fs.readFileSync(subFile, 'utf8');
+    content = content.replace(/(\d{2}):(\d{2}):(\d{2}),(\d{3})/g, function (m, h, mi, s, ms) {
+      var total = (+h) * 3600 + (+mi) * 60 + (+s) + (+ms) / 1000 - streamOffset;
+      if (total < 0) total = 0;
+      var H = Math.floor(total / 3600);
+      var M = Math.floor((total % 3600) / 60);
+      var S = Math.floor(total % 60);
+      var MS = Math.round((total % 1) * 1000);
+      return String(H).padStart(2, '0') + ':' + String(M).padStart(2, '0') + ':' + String(S).padStart(2, '0') + ',' + String(MS).padStart(3, '0');
+    });
+    var shifted = subFile.replace('.srt', '-shifted.srt');
+	fs.writeFileSync(shifted, content);
+	subFile = shifted;
+  }
+
+  // Video filter
+  let vf = (avSync ? 'setpts=PTS+' + avSync / 1000 + '/TB,' : '') +
+           "fps='min(source_fps,30)'";
+  if (subFile) vf += `,subtitles=${subFile}:force_style='Fontsize=22,PrimaryColour=&H00FFFFFF'`;
+  vf += ',' + fitFilter(preset.scale);
+
   args.push('-c:v', 'mpeg1video', '-b:v', preset.kbps + 'k', '-maxrate', maxKbps + 'k',
     '-bufsize', maxKbps + 'k', '-qmin', '2', '-bf', '0',
-    '-vf', (avSync ? 'setpts=PTS+' + avSync / 1000 + '/TB,' : '') + "fps='min(source_fps,30)'," + fitFilter(preset.scale));
-  // JSMpeg queues audio for playback as it arrives, so A/V sync depends on
-  // audio arriving with its video. The TS muxer normally batches ~2.9 KB of
-  // audio per PES packet (~180 ms at 128k), which made audio lag by that much;
-  // -pes_payload_size 0 sends each MP2 frame (~26 ms) as soon as it's encoded.
+    '-vf', vf);
   if (muxed) {
     if (AUDIO_FILTER && !source.generator) args.push('-af', AUDIO_FILTER);
     args.push('-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2', '-pes_payload_size', '0');
@@ -377,15 +453,17 @@ wss.on('connection', async (ws, req) => {
   else args.push('-an');
   args.push('-f', 'mpegts', '-muxdelay', '0', '-muxpreload', '0', '-flush_packets', '1', '-');
 
-  // Total stream bitrate ceiling, so the client can turn backlog bytes into seconds.
   send(ws, 'metric', 'streamKbps', { value: maxKbps + (muxed ? 128 : 0) });
 
   benchMark(q.bench, 'video');
   const spawnAt = Date.now();
-  // Bytes queued here because the client or network can't keep up; the
-  // client uses it to step quality down.
   const backlogTimer = setInterval(() => send(ws, 'metric', 'backlog', { value: ws.bufferedAmount }), 1000);
+  
+  console.log('subFile:', subFile);
+  
   const ffmpeg = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+
+
   var first = true;
 
   ffmpeg.stdout.on('data', (chunk) => {
@@ -397,5 +475,15 @@ wss.on('connection', async (ws, req) => {
     if (code) send(ws, 'status', 'Stream ended (code ' + code + ')');
     try { ws.close(); } catch (e) {}
   });
-  ws.on('close', () => { clearInterval(backlogTimer); try { ffmpeg.kill('SIGKILL'); } catch (e) {} });
+
+      const cleanup = () => {
+    clearInterval(backlogTimer);
+    try { ffmpeg.kill('SIGKILL'); } catch (e) {}
+    // Remove shifted copy if we made one; keep the main cache
+    if (subFile && subFile.indexOf('-off') !== -1 || subFile && subFile.indexOf('-shifted') !== -1) {
+      fs.unlink(subFile, () => {});
+    }
+  };
+  ws.on('close', cleanup);
+  ffmpeg.on('close', cleanup);
 });
