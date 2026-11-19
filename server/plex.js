@@ -1,330 +1,489 @@
-// Plex integration: PIN sign-in against plex.tv, server discovery, and the
-// handful of library endpoints the player needs. Plex tokens never leave the
-// server; the browser only holds an opaque session cookie.
-const fs = require('fs');
+const express = require('express');
 const path = require('path');
-const crypto = require('crypto');
+const fs = require('fs');
+const url = require('url');
+const { Readable } = require('stream');
+const { spawn } = require('child_process');
+const { WebSocketServer } = require('ws');
+const plex = require('./plex');
 
-const PRODUCT = 'Canvas Stream PoC';
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const STATE_FILE = path.join(DATA_DIR, 'state.json');
-// Optional: skip server discovery and talk to this server directly
-// (e.g. http://192.168.1.10:32400).
-const PLEX_URL = (process.env.PLEX_URL || '').replace(/\/+$/, '');
-// Optional: comma-separated Plex usernames or emails allowed to sign in.
-// Unset = any Plex account (fine on localhost, not on a public URL).
-const ALLOWED_USERS = (process.env.ALLOWED_PLEX_USERS || '')
-  .split(',').map(function (u) { return u.trim().toLowerCase(); }).filter(Boolean);
+const PORT = process.env.PORT || 8742;
+const HOST = process.env.HOST || '127.0.0.1';
+const FFMPEG = process.env.FFMPEG || 'ffmpeg';
+// Muxed mode: hold video back this long when it is sent. The client paces
+// video against the audio clock, so this is normally 0; it is kept as a
+// knob for clients that don't. Tune with /bench/.
+const AV_SYNC_MS = parseInt(process.env.AV_SYNC_MS || '0', 10);
+// Gentle compression + makeup gain + limiter. Sources measured -24 to -33
+// LUFS (5.1 downmixes are quietest); this brings them to about -15 to -18
+// LUFS with true peaks under -1.5 dBFS, and adds no meaningful latency.
+// Set AUDIO_NORMALIZE=0 to pass audio through unchanged.
+const AUDIO_FILTER = process.env.AUDIO_NORMALIZE === '0' ? '' :
+  'acompressor=threshold=0.05:ratio=4:attack=5:release=300:makeup=6,' +
+  'alimiter=limit=0.79:attack=5:release=50:level=disabled';
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const REPORTS_DIR = path.join(__dirname, '..', 'probe-reports');
+const BENCH_DIR = path.join(__dirname, '..', 'bench-reports');
 
-// ============================================================
-// Persistent state: client identifier + sessions
-// ============================================================
-var state = { clientId: '', sessions: {} };
-try { state = Object.assign(state, JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))); } catch (e) {}
-if (!state.clientId) state.clientId = crypto.randomUUID();
-// Drop sessions for accounts that are no longer on the allowlist.
-Object.keys(state.sessions).forEach(function (sid) {
-  var u = state.sessions[sid].user;
-  if (u && !isAllowed(u)) delete state.sessions[sid];
-});
-saveState();
-
-function isAllowed(user) {
-  if (!ALLOWED_USERS.length) return true;
-  return [user.username, user.email].some(function (v) { return v && ALLOWED_USERS.indexOf(v.toLowerCase()) !== -1; });
-}
-
-function saveState() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
-}
-
-function parseCookies(header) {
-  var out = {};
-  String(header || '').split(';').forEach(function (part) {
-    var i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
-  });
-  return out;
-}
-
-// Returns the session for a request (Express req or raw upgrade req), or null.
-function getSession(req) {
-  var sid = parseCookies(req.headers.cookie).sid;
-  return sid && state.sessions[sid] ? state.sessions[sid] : null;
-}
-
-function getOrCreateSession(req, res) {
-  var sid = parseCookies(req.headers.cookie).sid;
-  if (!sid || !state.sessions[sid]) {
-    sid = crypto.randomBytes(24).toString('hex');
-    state.sessions[sid] = { id: sid, createdAt: Date.now() };
-    res.setHeader('Set-Cookie', 'sid=' + sid + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000');
-  }
-  return state.sessions[sid];
-}
-
-// ============================================================
-// HTTP helpers
-// ============================================================
-function plexHeaders(token) {
-  var h = {
-    Accept: 'application/json',
-    'X-Plex-Product': PRODUCT,
-    'X-Plex-Client-Identifier': state.clientId,
-    'X-Plex-Device-Name': PRODUCT,
-    'X-Plex-Platform': 'Web',
-  };
-  if (token) h['X-Plex-Token'] = token;
-  return h;
-}
-
-async function plexFetch(url, opts) {
-  opts = opts || {};
-  var res = await fetch(url, {
-    method: opts.method || 'GET',
-    headers: Object.assign(plexHeaders(opts.token), opts.headers || {}),
-    signal: AbortSignal.timeout(opts.timeout || 10000),
-  });
-  if (!res.ok) {
-    var err = new Error('Plex request failed (' + res.status + ')');
-    err.status = res.status;
-    throw err;
-  }
-  return opts.raw ? res : res.json();
-}
-
-// ============================================================
-// Sign-in (PIN flow)
-// ============================================================
-async function createPin(session, forwardUrl) {
-  var pin = await plexFetch('https://plex.tv/api/v2/pins?strong=true', { method: 'POST' });
-  session.pin = { id: pin.id, code: pin.code };
-  saveState();
-  var params = new URLSearchParams({
-    clientID: state.clientId,
-    code: pin.code,
-    'context[device][product]': PRODUCT,
-  });
-  if (forwardUrl) params.set('forwardUrl', forwardUrl);
-  return 'https://app.plex.tv/auth#?' + params.toString();
-}
-
-// Resolves true once the user has approved the PIN. Throws (status 403) if
-// the account isn't on the allowlist; its token is discarded.
-async function checkPin(session) {
-  if (session.token) return true;
-  if (!session.pin) return false;
-  var pin = await plexFetch('https://plex.tv/api/v2/pins/' + session.pin.id);
-  if (!pin.authToken) return false;
-  delete session.pin;
-  var user = await plexFetch('https://plex.tv/api/v2/user', { token: pin.authToken });
-  var info = { username: user.username || user.title, email: user.email, thumb: user.thumb };
-  if (!isAllowed(info)) {
-    saveState();
-    console.log('Rejected Plex sign-in from ' + info.username);
-    var err = new Error('The Plex account "' + info.username + '" is not allowed on this server.');
-    err.status = 403;
-    throw err;
-  }
-  session.token = pin.authToken;
-  session.user = info;
-  saveState();
-  return true;
-}
-
-function logout(session) {
-  delete state.sessions[session.id];
-  saveState();
-}
-
-// ============================================================
-// Servers
-// ============================================================
-// baseUrl cache: "<sessionId>:<serverId>" -> { url, token }
-var connCache = new Map();
-
-async function listServers(session) {
-  if (PLEX_URL) {
-    var root = await plexFetch(PLEX_URL + '/', { token: session.token });
-    var mc = root.MediaContainer || {};
-    return [{ id: mc.machineIdentifier, name: mc.friendlyName || 'Plex', owned: true, connections: [{ uri: PLEX_URL }], accessToken: session.token }];
-  }
-  var resources = await plexFetch('https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1', { token: session.token });
-  return resources
-    .filter(function (r) { return String(r.provides || '').split(',').indexOf('server') !== -1; })
-    .map(function (r) {
-      return {
-        id: r.clientIdentifier,
-        name: r.name,
-        owned: !!r.owned,
-        online: r.presence,
-        accessToken: r.accessToken || session.token,
-        connections: r.connections || [],
-      };
-    });
-}
-
-// Probes every advertised connection at once and picks the best one that
-// answers: local direct, then remote direct, then relay.
-async function connect(session) {
-  if (!session.serverId) throw new Error('No Plex server selected');
-  var key = session.id + ':' + session.serverId;
-  if (connCache.has(key)) return connCache.get(key);
-
-  var servers = await listServers(session);
-  var server = servers.find(function (s) { return s.id === session.serverId; });
-  if (!server) throw new Error('Selected Plex server is not available');
-
-  function rank(c) { return c.relay ? 2 : c.local ? 0 : 1; }
-  var candidates = server.connections.slice().sort(function (a, b) { return rank(a) - rank(b); });
-  var results = await Promise.all(candidates.map(function (c) {
-    return plexFetch(c.uri + '/identity', { token: server.accessToken, timeout: 4000 })
-      .then(function () { return c; }, function () { return null; });
-  }));
-  var ok = results.find(Boolean);
-  if (!ok) throw new Error('Could not reach Plex server "' + server.name + '"');
-  var conn = { url: ok.uri.replace(/\/+$/, ''), token: server.accessToken, name: server.name };
-  connCache.set(key, conn);
-  return conn;
-}
-
-function selectServer(session, serverId) {
-  session.serverId = serverId;
-  saveState();
-}
-
-// ============================================================
-// Library
-// ============================================================
-async function serverGet(session, pathAndQuery) {
-  var conn = await connect(session);
-  return plexFetch(conn.url + pathAndQuery, { token: conn.token });
-}
-
-function summarize(m) {
-  var media = m.Media && m.Media[0];
-  return {
-    key: m.ratingKey,
-    parentKey: m.parentRatingKey,
-    grandparentKey: m.grandparentRatingKey,
-    type: m.type,
-    title: m.title,
-    parentTitle: m.parentTitle,
-    grandparentTitle: m.grandparentTitle,
-    index: m.index,
-    parentIndex: m.parentIndex,
-    year: m.year,
-    summary: m.summary,
-    thumb: m.thumb || m.parentThumb || m.grandparentThumb,
-    grandparentThumb: m.grandparentThumb || m.parentThumb,
-    art: m.art || m.grandparentArt,
-    contentRating: m.contentRating,
-    rating: m.audienceRating || m.rating,
-    studio: m.studio,
-    tagline: m.tagline,
-    genres: (m.Genre || []).map(function (g) { return g.tag; }).slice(0, 3),
-    resolution: media && media.videoResolution,
-    childCount: m.childCount,
-    duration: m.duration,
-    viewOffset: m.viewOffset,
-    leafCount: m.leafCount,
-    viewedLeafCount: m.viewedLeafCount,
-    viewCount: m.viewCount,
-    playable: m.type === 'movie' || m.type === 'episode' || m.type === 'clip',
-  };
-}
-
-async function libraries(session) {
-  var data = await serverGet(session, '/library/sections');
-  return (data.MediaContainer.Directory || [])
-    .filter(function (d) { return d.type === 'movie' || d.type === 'show'; })
-    .map(function (d) { return { key: d.key, title: d.title, type: d.type }; });
-}
-
-async function libraryItems(session, sectionKey, opts) {
-  var q = new URLSearchParams({
-    'X-Plex-Container-Start': String(opts.start || 0),
-    'X-Plex-Container-Size': String(opts.size || 60),
-    sort: opts.sort || 'titleSort',
-  });
-  if (opts.title) q.set('title', opts.title);
-  var data = await serverGet(session, '/library/sections/' + sectionKey + '/all?' + q);
-  var mc = data.MediaContainer;
-  return { total: mc.totalSize != null ? mc.totalSize : mc.size, items: (mc.Metadata || []).map(summarize) };
-}
-
-async function onDeck(session) {
-  var data = await serverGet(session, '/library/onDeck?X-Plex-Container-Size=20');
-  return (data.MediaContainer.Metadata || []).map(summarize);
-}
-
-async function recentlyAdded(session) {
-  var data = await serverGet(session, '/library/recentlyAdded?X-Plex-Container-Size=24');
-  return (data.MediaContainer.Metadata || []).map(summarize);
-}
-
-async function search(session, query) {
-  var q = new URLSearchParams({ query: query, limit: '12' });
-  var data = await serverGet(session, '/hubs/search?' + q);
-  var out = [];
-  (data.MediaContainer.Hub || []).forEach(function (hub) {
-    if (['movie', 'show', 'episode'].indexOf(hub.type) === -1) return;
-    (hub.Metadata || []).forEach(function (m) { out.push(summarize(m)); });
-  });
-  return out;
-}
-
-// Reports playback position so Plex keeps On Deck and resume points current,
-// and marks the item watched near the end.
-async function timeline(session, opts) {
-  var conn = await connect(session);
-  var q = new URLSearchParams({
-    ratingKey: opts.key,
-    key: '/library/metadata/' + opts.key,
-    state: opts.state,
-    time: String(Math.round(opts.time)),
-    duration: String(Math.round(opts.duration || 0)),
-  });
-  await plexFetch(conn.url + '/:/timeline?' + q, { token: conn.token, raw: true });
-}
-
-async function item(session, ratingKey) {
-  var data = await serverGet(session, '/library/metadata/' + ratingKey);
-  var m = (data.MediaContainer.Metadata || [])[0];
-  if (!m) throw new Error('Item not found');
-  var out = summarize(m);
-  if (!out.playable) {
-    var kids = await serverGet(session, '/library/metadata/' + ratingKey + '/children');
-    out.children = (kids.MediaContainer.Metadata || []).map(summarize);
-  }
-  return out;
-}
-
-// Resolves a ratingKey to a direct file URL ffmpeg can read. The URL carries
-// the token, so it must only ever be handed to child processes.
-async function mediaUrl(session, ratingKey) {
-  var conn = await connect(session);
-  var data = await plexFetch(conn.url + '/library/metadata/' + ratingKey, { token: conn.token });
-  var m = (data.MediaContainer.Metadata || [])[0];
-  var part = m && m.Media && m.Media[0] && m.Media[0].Part && m.Media[0].Part[0];
-  if (!part) throw new Error('No playable media for this item');
-  return {
-    url: conn.url + part.key + (part.key.indexOf('?') === -1 ? '?' : '&') + 'X-Plex-Token=' + encodeURIComponent(conn.token),
-    duration: m.duration,
-    title: m.grandparentTitle ? m.grandparentTitle + ' - ' + m.title : m.title,
-  };
-}
-
-// Streams a resized poster through the server so the token stays private.
-async function thumb(session, thumbPath, w, h) {
-  var conn = await connect(session);
-  var q = new URLSearchParams({ width: String(w), height: String(h), minSize: '1', upscale: '1', url: thumbPath, 'X-Plex-Token': conn.token });
-  return plexFetch(conn.url + '/photo/:/transcode?' + q, { token: conn.token, raw: true, headers: { Accept: 'image/*' } });
-}
-
-module.exports = {
-  getSession, getOrCreateSession, createPin, checkPin, logout,
-  listServers, selectServer, connect,
-  libraries, libraryItems, onDeck, recentlyAdded, search, timeline, item, mediaUrl, thumb,
+// Target bitrate per preset; the encoder may burst to 1.25x on hard scenes.
+const QUALITY = {
+  360: { scale: '640:360', kbps: 700 },
+  480: { scale: '854:480', kbps: 1200 },
+  720: { scale: '1280:720', kbps: 2200 },
+  1080: { scale: '1920:1080', kbps: 4000 },
 };
+
+const app = express();
+// Behind cloudflared/nginx on this machine: trust X-Forwarded-Proto so the
+// Plex sign-in redirect goes back to the https URL.
+app.set('trust proxy', 'loopback');
+app.get('/', (req, res) => res.redirect('/player/'));
+
+// The player page links its scripts and styles with a content hash
+// (app.js?v=…), so a deploy reaches every browser on its next page load even
+// where a CDN or browser has cached the old files. The page itself is sent
+// with no-cache. Computed once at startup; files only change on deploy.
+const PLAYER_DIR = path.join(PUBLIC_DIR, 'player');
+const PLAYER_ASSETS = ['app.js', 'app.css', 'stream.js', 'jsmpeg.min.js'];
+const playerPage = (() => {
+  var html = fs.readFileSync(path.join(PLAYER_DIR, 'index.html'), 'utf8');
+  PLAYER_ASSETS.forEach((name) => {
+    var hash = require('crypto').createHash('sha256').update(fs.readFileSync(path.join(PLAYER_DIR, name))).digest('hex').slice(0, 10);
+    html = html.split('"' + name + '"').join('"' + name + '?v=' + hash + '"');
+  });
+  return html;
+})();
+app.get(['/player/', '/player/index.html'], (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.type('html').send(playerPage);
+});
+// Revalidate on every load (unchanged files answer 304), so a deploy reaches
+// browsers right away instead of after their heuristic cache expires.
+app.use(express.static(PUBLIC_DIR, { setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache') }));
+app.use(express.json({ limit: '1mb' }));
+
+// ============================================================
+// Source resolution
+// ============================================================
+// A source is one of:
+//   "test"           ffmpeg's test pattern + tone (no network needed)
+//   "sync"           a flash + beep every second, for the A/V benchmark
+//   "tone"           a steady 440 Hz sine, for finding audio glitches
+//   "plex:<key>"     a Plex item by ratingKey (needs a signed-in session)
+// Arguments are always passed to child processes as argv, never through a shell.
+async function resolveSource(src, session) {
+  if (src === 'test' || src === 'sync' || src === 'tone') return { generator: src };
+  var m = /^plex:(\d+)$/.exec(src);
+  if (!m) throw new Error('Unknown source');
+  if (!session || !session.token) throw new Error('Sign in to Plex first');
+  return plex.mediaUrl(session, m[1]);
+}
+
+// The "sync" source flashes one of 8 vertical bars and plays a beep whose
+// pitch matches the bar (500 Hz + 100 Hz * bar) for 150 ms at the start of
+// every second. The bar/pitch pair lets the benchmark match each flash to its
+// beep even when audio lags by several seconds.
+function syncVideoFilter(size) {
+  var w = size[0] / 8;
+  var f = 'color=c=black:s=' + size.join('x') + ':r=30';
+  for (var i = 0; i < 8; i++) {
+    f += ',drawbox=x=' + (i * w) + ':y=0:w=' + w + ':h=' + size[1] +
+      ":color=white:t=fill:enable='eq(mod(floor(t),8)," + i + ")*lt(mod(t,1),0.15)'";
+  }
+  return f;
+}
+const SYNC_AUDIO = "aevalsrc='if(lt(mod(t,1),0.15),0.8*sin(2*PI*(500+100*mod(floor(t),8))*t),0)':s=44100:c=stereo";
+
+// Read at native rate. ffmpeg 7+ bursts the first 0.5 s by default; JSMpeg
+// has no jitter buffer and plays whatever arrives, so a burst only plays
+// fast and gets audio dropped.
+const PACE = ['-re', '-readrate_initial_burst', '0'];
+
+// kind is 'video', 'audio' or 'both': each pipe only opens the input it needs.
+function inputArgs(source, kind, offset) {
+  if (source.generator) {
+    // Generators are paced with the realtime filters: -re lets lavfi run
+    // ~0.4 s ahead of the wall clock, which skews the benchmark's latency.
+    var v = (source.generator === 'sync' ? syncVideoFilter([1280, 720]) : 'testsrc2=size=1280x720:rate=30') + ',realtime';
+    var a = (source.generator === 'sync' ? SYNC_AUDIO
+      : source.generator === 'tone' ? "aevalsrc='0.5*sin(2*PI*440*t)':s=44100:c=stereo"
+      : 'sine=frequency=440:beep_factor=4') + ',arealtime';
+    var args = [];
+    if (kind !== 'audio') args.push('-f', 'lavfi', '-i', v);
+    if (kind !== 'video') args.push('-f', 'lavfi', '-i', a);
+    if (kind === 'both') args.push('-map', '0:v', '-map', '1:a');
+    return args;
+  }
+  var out = [...PACE, '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '30'];
+  if (offset > 0) out.push('-ss', String(offset));
+  out.push('-i', source.url);
+  if (kind === 'both') out.push('-map', '0:v:0', '-map', '0:a:0?');
+  return out;
+}
+
+// Scale to fit the preset without stretching, letterboxing/pillarboxing the
+// rest, so 4:3 or 2.39:1 sources keep their shape on the fixed-size canvas.
+function fitFilter(scale) {
+  var wh = scale.split(':');
+  return 'scale=' + scale + ':force_original_aspect_ratio=decrease:force_divisible_by=2,' +
+    'pad=' + wh[0] + ':' + wh[1] + ':(ow-iw)/2:(oh-ih)/2,setsar=1';
+}
+
+function parseOffset(v) {
+  var n = parseFloat(v);
+  return isFinite(n) && n > 0 ? n : 0;
+}
+
+// ============================================================
+// Benchmark bookkeeping: when each ffmpeg was spawned, keyed by the
+// client-chosen bench id, so the bench page can compute end-to-end latency.
+// ============================================================
+const benchRuns = new Map();
+function benchMark(id, kind) {
+  if (!id) return;
+  var run = benchRuns.get(id) || { createdAt: Date.now() };
+  run[kind + 'SpawnAt'] = Date.now();
+  benchRuns.set(id, run);
+  for (const [k, r] of benchRuns) if (Date.now() - r.createdAt > 10 * 60 * 1000) benchRuns.delete(k);
+}
+
+app.get('/api/bench/:id', (req, res) => res.json(benchRuns.get(req.params.id) || {}));
+
+app.post('/api/bench-report', (req, res) => {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = path.join(BENCH_DIR, `bench-${timestamp}.json`);
+  fs.mkdirSync(BENCH_DIR, { recursive: true });
+  fs.writeFileSync(filename, JSON.stringify(req.body || {}, null, 2));
+  console.log(`Bench report saved: ${filename}`);
+  res.json({ ok: true, file: path.relative(path.join(__dirname, '..'), filename) });
+});
+
+// ============================================================
+// PROBE: diagnostic report receiver
+// ============================================================
+app.post('/api/probe-report', (req, res) => {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = path.join(REPORTS_DIR, `probe-${timestamp}.json`);
+  fs.mkdirSync(REPORTS_DIR, { recursive: true });
+  fs.writeFileSync(filename, JSON.stringify(req.body || {}, null, 2));
+  console.log(`Probe report saved: ${filename}`);
+  res.json({ ok: true });
+});
+
+// ============================================================
+// PLEX: sign-in and library browsing
+// ============================================================
+function wrap(fn) {
+  return (req, res) => Promise.resolve(fn(req, res)).catch((e) => {
+    res.status(e.status === 401 || e.status === 403 ? e.status : 502).json({ error: e.message });
+  });
+}
+
+function requireLogin(req, res, next) {
+  var s = plex.getSession(req);
+  if (!s || !s.token) return res.status(401).json({ error: 'Not signed in' });
+  req.plex = s;
+  next();
+}
+
+function requireServer(req, res, next) {
+  if (!req.plex.serverId) return res.status(409).json({ error: 'No Plex server selected' });
+  next();
+}
+
+app.post('/api/plex/pin', wrap(async (req, res) => {
+  var session = plex.getOrCreateSession(req, res);
+  var forward = req.protocol + '://' + req.get('host') + '/player/?signedin=1';
+  res.json({ authUrl: await plex.createPin(session, forward) });
+}));
+
+app.get('/api/plex/pin', wrap(async (req, res) => {
+  var s = plex.getSession(req);
+  try { res.json({ done: s ? await plex.checkPin(s) : false }); }
+  catch (e) { if (e.status === 403) return res.json({ done: false, error: e.message }); throw e; }
+}));
+
+app.get('/api/plex/me', wrap(async (req, res) => {
+  var s = plex.getSession(req);
+  // Finishes a pending PIN when sign-in came back via redirect, not the popup.
+  var error;
+  if (s && !s.token && s.pin) await plex.checkPin(s).catch((e) => { if (e.status === 403) error = e.message; });
+  if (!s || !s.token) return res.json({ signedIn: false, error });
+  res.json({ signedIn: true, user: s.user, serverId: s.serverId || null });
+}));
+
+app.post('/api/plex/logout', (req, res) => {
+  var s = plex.getSession(req);
+  if (s) plex.logout(s);
+  res.json({ ok: true });
+});
+
+app.get('/api/plex/servers', requireLogin, wrap(async (req, res) => {
+  var servers = await plex.listServers(req.plex);
+  res.json(servers.map((s) => ({ id: s.id, name: s.name, owned: s.owned, online: s.online })));
+}));
+
+app.post('/api/plex/server', requireLogin, wrap(async (req, res) => {
+  plex.selectServer(req.plex, String(req.body.id || ''));
+  var conn = await plex.connect(req.plex);
+  res.json({ ok: true, name: conn.name });
+}));
+
+app.get('/api/plex/libraries', requireLogin, requireServer, wrap(async (req, res) => {
+  res.json(await plex.libraries(req.plex));
+}));
+
+app.get('/api/plex/library/:key', requireLogin, requireServer, wrap(async (req, res) => {
+  if (!/^\d+$/.test(req.params.key)) return res.status(400).json({ error: 'Bad key' });
+  res.json(await plex.libraryItems(req.plex, req.params.key, {
+    start: parseInt(req.query.start) || 0,
+    title: req.query.title ? String(req.query.title) : '',
+  }));
+}));
+
+app.get('/api/plex/ondeck', requireLogin, requireServer, wrap(async (req, res) => {
+  res.json(await plex.onDeck(req.plex));
+}));
+
+app.get('/api/plex/home', requireLogin, requireServer, wrap(async (req, res) => {
+  var both = await Promise.all([plex.onDeck(req.plex), plex.recentlyAdded(req.plex)]);
+  res.json({ onDeck: both[0], recent: both[1] });
+}));
+
+// Incompressible bytes for the client's bandwidth estimate.
+const SPEEDTEST_BLOCK = require('crypto').randomBytes(64 * 1024);
+app.get('/api/speedtest', requireLogin, (req, res) => {
+  var kb = Math.max(16, Math.min(4096, parseInt(req.query.kb) || 256));
+  res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': kb * 1024, 'Cache-Control': 'no-store' });
+  for (var i = 0; i < kb / 64; i++) res.write(SPEEDTEST_BLOCK.subarray(0, Math.min(64, kb - i * 64) * 1024));
+  res.end();
+});
+
+app.get('/api/plex/search', requireLogin, requireServer, wrap(async (req, res) => {
+  var q = String(req.query.q || '').trim().slice(0, 100);
+  res.json(q ? await plex.search(req.plex, q) : []);
+}));
+
+app.post('/api/plex/timeline', requireLogin, requireServer, wrap(async (req, res) => {
+  var b = req.body || {};
+  if (!/^\d+$/.test(String(b.key)) || ['playing', 'paused', 'stopped'].indexOf(b.state) === -1) {
+    return res.status(400).json({ error: 'Bad timeline update' });
+  }
+  await plex.timeline(req.plex, { key: String(b.key), state: b.state, time: +b.time || 0, duration: +b.duration || 0 });
+  res.json({ ok: true });
+}));
+
+app.get('/api/plex/item/:key', requireLogin, requireServer, wrap(async (req, res) => {
+  if (!/^\d+$/.test(req.params.key)) return res.status(400).json({ error: 'Bad key' });
+  res.json(await plex.item(req.plex, req.params.key));
+}));
+
+app.get('/api/plex/subtitles/:key', requireLogin, requireServer, wrap(async (req, res) => {
+  if (!/^\d+$/.test(req.params.key)) return res.status(400).json({ error: 'Bad key' });
+  res.json(await plex.subtitles(req.plex, req.params.key));
+}));
+
+app.get('/api/plex/thumb', requireLogin, requireServer, wrap(async (req, res) => {
+  var p = String(req.query.path || '');
+  if (!/^\/library\/[\w/.-]+$/.test(p)) return res.status(400).end();
+  var w = Math.min(parseInt(req.query.w) || 200, 800);
+  var h = Math.min(parseInt(req.query.h) || 300, 1200);
+  var upstream = await plex.thumb(req.plex, p, w, h);
+  res.setHeader('Content-Type', upstream.headers.get('content-type') || 'image/jpeg');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  Readable.fromWeb(upstream.body).pipe(res);
+}));
+
+// ============================================================
+// AUDIO (split mode): low-bitrate MP3 over plain HTTP
+// ============================================================
+app.get('/api/audio', async (req, res) => {
+  var source;
+  try { source = await resolveSource(String(req.query.src || ''), plex.getSession(req)); }
+  catch (err) { return res.status(400).json({ error: err.message }); }
+  res.writeHead(200, {
+    'Content-Type': 'audio/mpeg',
+    'Cache-Control': 'no-cache, no-store',
+  });
+  var args = inputArgs(source, 'audio', parseOffset(req.query.offset));
+  args.push(
+    '-vn', '-fflags', 'nobuffer', '-flags', 'low_delay',
+    ...(AUDIO_FILTER && !source.generator ? ['-af', AUDIO_FILTER] : []),
+    '-c:a', 'libmp3lame', '-b:a', '48k', '-ar', '22050', '-ac', '1',
+    '-f', 'mp3', '-'
+  );
+  benchMark(req.query.bench, 'audio');
+  const ffmpeg = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  ffmpeg.stderr.on('data', d => console.log('ffmpeg:', d.toString()));
+  ffmpeg.stdout.pipe(res);
+  ffmpeg.on('error', () => { try { res.end(); } catch (e) {} });
+  ffmpeg.on('exit', () => { try { res.end(); } catch (e) {} });
+  req.on('close', () => ffmpeg.kill('SIGKILL'));
+});
+
+app.get('/api/plex/audio/:key', requireLogin, requireServer, wrap(async (req, res) => {
+  if (!/^\d+$/.test(req.params.key)) return res.status(400).json({ error: 'Bad key' });
+  res.json(await plex.audioTracks(req.plex, req.params.key));
+}));
+
+// ============================================================
+// VIDEO: MPEG1-TS over WebSocket, decoded client-side by JSMpeg.
+// mode=muxed (default) also carries MP2 audio in the same TS, which JSMpeg
+// plays through WebAudio on the same clock as the video.
+// mode=split sends video only; audio comes from /api/audio.
+// ============================================================
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
+const server = app.listen(PORT, HOST, () => {
+  console.log(`Canvas stream PoC on http://${HOST}:${PORT}`);
+});
+
+server.on('upgrade', (req, socket, head) => {
+  const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
+  if (pathname === '/ws/video') {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
+});
+
+function send(ws, type, message, extra) {
+  try { if (ws.readyState === 1) ws.send(JSON.stringify(Object.assign({ type, message }, extra))); } catch (e) {}
+}
+
+wss.on('connection', async (ws, req) => {
+  const q = Object.fromEntries(new URL(req.url, `http://${req.headers.host}`).searchParams);
+  const preset = QUALITY[parseInt(q.quality)] || QUALITY[720];
+  const muxed = q.mode !== 'split';
+  const avSync = muxed ? Math.max(0, Math.min(2000, q.avsync != null && q.avsync !== '' ? parseInt(q.avsync) || 0 : AV_SYNC_MS)) : 0;
+  const t0 = Date.now();
+
+  send(ws, 'status', 'Resolving source...');
+  var source;
+  try { source = await resolveSource(String(q.src || ''), plex.getSession(req)); }
+  catch (err) { send(ws, 'error', err.message); return ws.close(); }
+  if (ws.readyState !== 1) return;
+  send(ws, 'metric', 'resolveMs', { value: Date.now() - t0 });
+  send(ws, 'metric', 'avSyncMs', { value: avSync });
+  if (source.duration) send(ws, 'info', source.title, { duration: source.duration });
+
+  send(ws, 'status', 'Starting stream...');
+  const audioIndex = parseInt(q.audio);
+  const useAudio = isFinite(audioIndex) && audioIndex >= 0;
+
+  var args = inputArgs(source, muxed ? 'both' : 'video', parseOffset(q.offset));
+  if (muxed && useAudio && !source.generator) {
+    for (var i = args.length - 1; i >= 0; i--) {
+      if (args[i] === '-map' && args[i + 1] && args[i + 1].indexOf('0:a') === 0) {
+        args.splice(i, 2);
+      }
+    }
+    args.push('-map', '0:a:' + audioIndex);
+  }
+  var maxKbps = Math.round(preset.kbps * 1.25);
+
+  // Optional subtitle burn-in with caching
+  const subIndex = parseInt(q.sub);
+  const useSub = !source.generator && isFinite(subIndex) && subIndex >= 0;
+  let subFile = null;
+  const streamOffset = parseOffset(q.offset);
+
+  if (useSub) {
+    try {
+      fs.mkdirSync('/app/data/tmp', { recursive: true });
+      const cacheKey = String(q.src || '').replace(/[^a-z0-9]/gi, '_') + '-s' + subIndex;
+      subFile = `/app/data/tmp/${cacheKey}.srt`;
+
+      // Use cache if it exists and has content
+      if (!fs.existsSync(subFile) || fs.statSync(subFile).size === 0) {
+        console.log('Extracting subtitle to cache:', subFile);
+        await new Promise((resolve, reject) => {
+          const extractArgs = ['-i', source.url, '-map', `0:s:${subIndex}`, '-c:s', 'srt', '-y', subFile];
+          const extract = spawn(FFMPEG, extractArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+          let err = '';
+          extract.stderr.on('data', d => { err += d.toString(); });
+          extract.on('error', reject);
+          extract.on('close', code => code === 0 ? resolve() : reject(new Error(err.slice(-300))));
+        });
+        // Strip font tags so force_style works
+        if (fs.existsSync(subFile)) {
+          let content = fs.readFileSync(subFile, 'utf8');
+          content = content.replace(/<[^>]+>/g, '');
+          fs.writeFileSync(subFile, content);
+        }
+      } else {
+        console.log('Using cached subtitle:', subFile);
+      }
+    } catch (e) {
+      console.error('Subtitle extract failed:', e.message);
+      subFile = null;
+    }
+  }
+
+// Shift SRT timestamps if starting mid-file
+  if (subFile && streamOffset > 0 && fs.existsSync(subFile)) {
+    let content = fs.readFileSync(subFile, 'utf8');
+    content = content.replace(/(\d{2}):(\d{2}):(\d{2}),(\d{3})/g, function (m, h, mi, s, ms) {
+      var total = (+h) * 3600 + (+mi) * 60 + (+s) + (+ms) / 1000 - streamOffset;
+      if (total < 0) total = 0;
+      var H = Math.floor(total / 3600);
+      var M = Math.floor((total % 3600) / 60);
+      var S = Math.floor(total % 60);
+      var MS = Math.round((total % 1) * 1000);
+      return String(H).padStart(2, '0') + ':' + String(M).padStart(2, '0') + ':' + String(S).padStart(2, '0') + ',' + String(MS).padStart(3, '0');
+    });
+    var shifted = subFile.replace('.srt', '-shifted.srt');
+	fs.writeFileSync(shifted, content);
+	subFile = shifted;
+  }
+
+  // Video filter
+  let vf = (avSync ? 'setpts=PTS+' + avSync / 1000 + '/TB,' : '') +
+           "fps='min(source_fps,30)'";
+  if (subFile) vf += `,subtitles=${subFile}:force_style='Fontsize=22,PrimaryColour=&H00FFFFFF'`;
+  vf += ',' + fitFilter(preset.scale);
+
+  args.push('-c:v', 'mpeg1video', '-b:v', preset.kbps + 'k', '-maxrate', maxKbps + 'k',
+    '-bufsize', maxKbps + 'k', '-qmin', '2', '-bf', '0',
+    '-vf', vf);
+  if (muxed) {
+    if (AUDIO_FILTER && !source.generator) args.push('-af', AUDIO_FILTER);
+    args.push('-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2', '-pes_payload_size', '0');
+  }
+  else args.push('-an');
+  args.push('-f', 'mpegts', '-muxdelay', '0', '-muxpreload', '0', '-flush_packets', '1', '-');
+
+  send(ws, 'metric', 'streamKbps', { value: maxKbps + (muxed ? 128 : 0) });
+
+  benchMark(q.bench, 'video');
+  const spawnAt = Date.now();
+  const backlogTimer = setInterval(() => send(ws, 'metric', 'backlog', { value: ws.bufferedAmount }), 1000);
+  
+  console.log('subFile:', subFile);
+  
+  const ffmpeg = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+
+
+  var first = true;
+
+  ffmpeg.stdout.on('data', (chunk) => {
+    if (first) { first = false; send(ws, 'metric', 'ffmpegFirstByteMs', { value: Date.now() - spawnAt }); }
+    if (ws.readyState === 1) ws.send(chunk);
+  });
+  ffmpeg.on('error', (e) => { send(ws, 'error', e.message.slice(0, 100)); ws.close(); });
+  ffmpeg.on('close', (code) => {
+    if (code) send(ws, 'status', 'Stream ended (code ' + code + ')');
+    try { ws.close(); } catch (e) {}
+  });
+
+      const cleanup = () => {
+    clearInterval(backlogTimer);
+    try { ffmpeg.kill('SIGKILL'); } catch (e) {}
+    // Remove shifted copy if we made one; keep the main cache
+    if (subFile && subFile.indexOf('-off') !== -1 || subFile && subFile.indexOf('-shifted') !== -1) {
+      fs.unlink(subFile, () => {});
+    }
+  };
+  ws.on('close', cleanup);
+  ffmpeg.on('close', cleanup);
+});
