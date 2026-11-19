@@ -100,7 +100,7 @@
     toastTimer = setTimeout(function () { t.hidden = true; }, 4000);
   }
 
-  var prefs = { quality: 'auto', mode: 'muxed', volume: 1, muted: false, v: 2 };
+  var prefs = { quality: 'auto', mode: 'muxed', volume: 1, muted: false, v: 2, subIndex: -1, audioIndex: 0 };
   try {
     var saved = JSON.parse(localStorage.getItem('canvasPrefs') || '{}');
     if (!saved.v) delete saved.quality; // v1 saved a fixed 480p default; switch those to auto
@@ -649,6 +649,8 @@
     P.stream = CanvasStream({
       canvas: canvas, audio: new Audio(), src: 'plex:' + P.item.key, mode: prefs.mode,
       quality: P.level, offset: sec, buffer: P.buffer,
+      subIndex: prefs.subIndex,
+	  audioIndex: prefs.audioIndex,
       onStatus: function (t, isErr) { if (isErr) { setMsg(t, true); $('pSpin').hidden = true; } },
       onFrame: function () {
         if (!P.firstFrameAt) {
@@ -857,17 +859,61 @@
       return h('button.menu-item', { onclick: function () { m.hidden = true; fn(); } }, label, active ? h('span', { html: ICON.check, style: { display: 'contents' } }) : null);
     }
     function restart() { if (!P.paused) startAt(position()); }
-    fill(m,
-      h('div.menu-label', 'Quality'),
-      opt('Auto' + (prefs.quality === 'auto' ? ' (' + P.level + 'p)' : ''), prefs.quality === 'auto', function () { prefs.quality = 'auto'; savePrefs(); }),
-      ['1080', '720', '480', '360'].map(function (q) {
-        return opt(q + 'p', prefs.quality === q, function () { prefs.quality = q; P.level = q; savePrefs(); restart(); });
-      }),
-      h('div.menu-sep'),
-      h('div.menu-label', 'Audio'),
-      opt('In sync (WebAudio)', prefs.mode === 'muxed', function () { prefs.mode = 'muxed'; savePrefs(); restart(); }),
-      opt('Legacy <audio> (≈5 s lag)', prefs.mode === 'split', function () { prefs.mode = 'split'; savePrefs(); restart(); }));
-    m.hidden = false;
+
+    function buildMenu(subOpts, audioOpts) {
+      var items = [
+        h('div.menu-label', 'Quality'),
+        opt('Auto' + (prefs.quality === 'auto' ? ' (' + P.level + 'p)' : ''), prefs.quality === 'auto', function () { prefs.quality = 'auto'; savePrefs(); }),
+      ];
+      ['1080', '720', '480', '360'].forEach(function (q) {
+        items.push(opt(q + 'p', prefs.quality === q, function () { prefs.quality = q; P.level = q; savePrefs(); restart(); }));
+      });
+      items.push(
+        h('div.menu-sep'),
+        h('div.menu-label', 'Audio'),
+        opt('In sync (WebAudio)', prefs.mode === 'muxed', function () { prefs.mode = 'muxed'; savePrefs(); restart(); }),
+        opt('Legacy <audio> (≈5 s lag)', prefs.mode === 'split', function () { prefs.mode = 'split'; savePrefs(); restart(); })
+      );
+      if (audioOpts && audioOpts.length) {
+        items.push(h('div.menu-sep'), h('div.menu-label', 'Audio Track'));
+        items.push.apply(items, audioOpts);
+      }
+      items.push(
+        h('div.menu-sep'),
+        h('div.menu-label', 'Subtitles'),
+        opt('None', prefs.subIndex == null || prefs.subIndex < 0, function () { prefs.subIndex = -1; savePrefs(); restart(); })
+      );
+      if (subOpts) items.push.apply(items, subOpts);
+      fill(m, items);
+      m.hidden = false;
+    }
+
+    buildMenu(); // show immediately
+
+    if (P.item) {
+      // Load subtitles
+      fetch('/api/plex/subtitles/' + P.item.key)
+        .then(function (r) { return r.json(); })
+        .then(function (subs) {
+          var subOpts = (subs || []).map(function (s) {
+            return opt(s.title || s.language || ('Sub ' + s.index), prefs.subIndex === s.index, function () {
+              prefs.subIndex = s.index; savePrefs(); restart();
+            });
+          });
+          // Load audio tracks
+          return fetch('/api/plex/audio/' + P.item.key)
+            .then(function (r) { return r.json(); })
+            .then(function (tracks) {
+              var audioOpts = (tracks || []).map(function (t) {
+                return opt(t.title || t.language || ('Audio ' + t.index), prefs.audioIndex === t.index, function () {
+                  prefs.audioIndex = t.index; savePrefs(); restart();
+                });
+              });
+              buildMenu(subOpts, audioOpts);
+            });
+        })
+        .catch(function () {});
+    }
   };
   document.addEventListener('click', function (e) {
     if (!$('pMenu').hidden && !$('pMenu').contains(e.target)) $('pMenu').hidden = true;
