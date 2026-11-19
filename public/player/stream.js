@@ -24,7 +24,9 @@ window.CanvasStream = function (opts) {
   var qs = 'src=' + encodeURIComponent(opts.src) +
     (opts.offset ? '&offset=' + Math.floor(opts.offset) : '') +
     (opts.bench ? '&bench=' + encodeURIComponent(opts.bench) : '') +
-    (opts.avsync != null && opts.avsync !== '' ? '&avsync=' + parseInt(opts.avsync) : '');
+    (opts.avsync != null && opts.avsync !== '' ? '&avsync=' + parseInt(opts.avsync) : '') +
+	(opts.subIndex >= 0 ? '&sub=' + opts.subIndex : '') +
+	(opts.audioIndex >= 0 ? '&audio=' + opts.audioIndex : '');
   var wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host +
     '/ws/video?' + qs + '&quality=' + (opts.quality || 480) + '&mode=' + mode;
 
